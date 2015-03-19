@@ -1,0 +1,593 @@
+#include <mega328p.h>
+#include <delay.h>
+#include <sleep.h>
+#include <spi.h> 
+#include <1wire.h>
+#include <ds18b20.h>
+
+#asm
+   .equ __w1_port=0x05 ;PORTB
+   .equ __w1_bit=0
+#endasm
+
+/* Memory Map */
+#define CONFIG      0x00
+#define EN_AA       0x01
+#define EN_RXADDR   0x02
+#define SETUP_AW    0x03
+#define SETUP_RETR  0x04
+#define RF_CH       0x05
+#define RF_SETUP    0x06
+#define STATUS      0x07
+#define OBSERVE_TX  0x08
+#define CD          0x09
+#define RX_ADDR_P0  0x0A
+#define RX_ADDR_P1  0x0B
+#define RX_ADDR_P2  0x0C
+#define RX_ADDR_P3  0x0D
+#define RX_ADDR_P4  0x0E
+#define RX_ADDR_P5  0x0F
+#define TX_ADDR     0x10
+#define RX_PW_P0    0x11
+#define RX_PW_P1    0x12
+#define RX_PW_P2    0x13
+#define RX_PW_P3    0x14
+#define RX_PW_P4    0x15
+#define RX_PW_P5    0x16
+#define FIFO_STATUS 0x17
+
+/* Bit Mnemonics */
+#define MASK_RX_DR  6
+#define MASK_TX_DS  5
+#define MASK_MAX_RT 4
+#define EN_CRC      3
+#define CRCO        2
+#define PWR_UP      1
+#define PRIM_RX     0
+#define ENAA_P5     5
+#define ENAA_P4     4
+#define ENAA_P3     3
+#define ENAA_P2     2
+#define ENAA_P1     1
+#define ENAA_P0     0
+#define ERX_P5      5
+#define ERX_P4      4
+#define ERX_P3      3
+#define ERX_P2      2
+#define ERX_P1      1
+#define ERX_P0      0
+#define AW          0
+#define ARD         4
+#define ARC         0
+#define PLL_LOCK    4
+#define RF_DR       3
+#define RF_PWR      1
+#define LNA_HCURR   0        
+#define RX_DR       6
+#define TX_DS       5
+#define MAX_RT      4
+#define RX_P_NO     1
+#define TX_FULL     0
+#define PLOS_CNT    4
+#define ARC_CNT     0
+#define TX_REUSE    6
+#define FIFO_FULL   5
+#define TX_EMPTY    4
+#define RX_FULL     1
+#define RX_EMPTY    0
+
+/* Instruction Mnemonics */
+#define R_REGISTER    0x00
+#define W_REGISTER    0x20
+#define REGISTER_MASK 0x1F
+#define R_RX_PAYLOAD  0x61
+#define W_TX_PAYLOAD  0xA0
+#define FLUSH_TX      0xE1
+#define FLUSH_RX      0xE2
+#define REUSE_TX_PL   0xE3
+#define NOP           0xFF
+
+// Mirf settings
+#define mirf_CH         7
+#define mirf_PAYLOAD    7
+#define mirf_CONFIG     ( (1<<MASK_RX_DR) | (1<<EN_CRC) | (0<<CRCO) )
+
+// Definitions for selecting and enabling MiRF module
+#define mirf_CSN_hi     PORTC.1=1;
+#define mirf_CSN_lo     PORTC.1=0;
+#define mirf_CE_hi      PORTC.0=1;
+#define mirf_CE_lo      PORTC.0=0;
+
+
+
+#define TX_POWERUP mirf_config_register(CONFIG, mirf_CONFIG | ( (1<<PWR_UP) | (0<<PRIM_RX) ) )
+#define RX_POWERUP mirf_config_register(CONFIG, mirf_CONFIG | ( (1<<PWR_UP) | (1<<PRIM_RX) ) )
+#define POWERDOWN mirf_config_register(CONFIG, mirf_CONFIG | ( (0<<PWR_UP) | (0<<PRIM_RX) ) )
+
+
+#define ADC_VREF_TYPE 0xC0
+
+
+// Read the AD conversion result
+unsigned int read_adc(unsigned char adc_input)
+{
+ADMUX=adc_input | (ADC_VREF_TYPE & 0xff);
+// Delay needed for the stabilization of the ADC input voltage
+delay_ms(1);
+// Start the AD conversion
+ADCSRA|=0x40;
+// Wait for the AD conversion to complete
+while ((ADCSRA & 0x10)==0);
+ADCSRA|=0x10;
+return ADCW;
+}
+
+
+
+
+
+unsigned long int i=0;
+unsigned int ii=500;
+
+
+unsigned char PTX;
+unsigned char buffer[mirf_PAYLOAD];
+unsigned char status, result;
+float temp=0;                          // температура
+signed int tt1=0;
+bit start=1;
+unsigned char send;
+unsigned int pause=4;
+
+
+
+
+void mirf_init() 
+// Initializes pins ans interrupt to communicate with the MiRF module
+// Should be called in the early initializing phase at startup.
+{
+    // Define CSN and CE as Output and set them to default
+    mirf_CE_lo;
+    mirf_CSN_hi;
+}
+
+
+void mirf_config_register(unsigned char reg, unsigned char value)
+// Clocks only one byte into the given MiRF register
+{
+    mirf_CSN_lo;
+    spi(W_REGISTER | (REGISTER_MASK & reg));
+    spi(value);
+    mirf_CSN_hi;
+}
+
+void mirf_read_register(unsigned char reg)
+// Reads an array of bytes from the given start position in the MiRF registers.
+{
+    mirf_CSN_lo;
+    spi(R_REGISTER | (REGISTER_MASK & reg));  
+    result=(unsigned char) spi(0);
+//     read the MSB using SPI */
+//    result=(unsigned) spi(0)<<8;
+//    /* read the LSB using SPI and combine with MSB 
+//    result|=spi(0);
+
+    mirf_CSN_hi;
+}
+
+
+
+void mirf_write_register(unsigned char reg, unsigned char value) 
+// Writes an array of bytes into inte the MiRF registers.
+{
+    mirf_CSN_lo;
+    spi(W_REGISTER | (REGISTER_MASK & reg));
+    spi(value);
+    mirf_CSN_hi;
+}
+
+void mirf_config_RX() 
+// Sets the important registers in the MiRF module and powers the module
+// in receiving mode
+{
+    // Set RF channel
+    mirf_config_register(RF_CH,mirf_CH);
+
+    // Set length of incoming payload 
+    mirf_config_register(RX_PW_P0, mirf_PAYLOAD);
+
+     //Start receiver 
+    PTX = 0;        // Start in receiving mode
+    RX_POWERUP;     // Power up in receiving mode
+    mirf_CE_hi;     // Listening for pakets
+}
+
+void mirf_set_RADDR(unsigned char adr) 
+// Sets the receiving address
+{
+    mirf_CE_lo;
+    mirf_write_register(RX_ADDR_P0,adr);
+    mirf_CE_hi;
+}
+
+void mirf_set_TADDR(unsigned char adr)
+// Sets the transmitting address
+{
+    mirf_CE_lo;
+    mirf_write_register(TX_ADDR, adr);
+    mirf_CE_hi;
+}
+
+interrupt [EXT_INT0] void ext_int0_isr(void)
+// Interrupt handler 
+{
+
+    if (PTX) 
+    {
+
+        mirf_CSN_lo;                                // Pull down chip select
+        status = spi(NOP);                        // Read status register
+        mirf_CSN_hi;                                // Pull up chip select
+
+        mirf_CE_lo;                             // Deactivate transreceiver
+        RX_POWERUP;                             // Power up in receiving mode
+        mirf_CE_hi;                             // Listening for pakets
+        PTX = 0;                                // Set to receiving mode
+
+        // Reset status register for further interaction
+        mirf_config_register(STATUS,(1<<TX_DS)|(1<<MAX_RT)); // Reset status register
+    }
+}
+
+
+
+ void mirf_send (void) 
+
+{
+
+unsigned char iii;
+    while (PTX) {}                  // Wait until last paket is send
+
+    mirf_CE_lo;
+
+    PTX = 1;                        // Set to transmitter mode
+    TX_POWERUP;                     // Power up
+//    
+//    mirf_CSN_lo;                    // Pull down chip select
+//    spi( FLUSH_TX );                // Write cmd to flush tx fifo
+//    mirf_CSN_hi;                    // Pull up chip select
+//    
+    mirf_CSN_lo;                    // Pull down chip select
+    spi( W_TX_PAYLOAD );            // Write cmd to write payload  
+    
+    for (iii=0;iii<mirf_PAYLOAD;iii++)
+      {
+      spi(buffer[iii]);                     // Write payload 
+      };  
+      
+    mirf_CSN_hi;                    // Pull up chip select
+    mirf_CE_hi;                     // Start transmission      
+    delay_us(50);
+    mirf_CE_lo;  
+    delay_ms(50);
+}
+
+                
+unsigned char mirf_data_ready() 
+// Checks if data is available for reading
+{
+    unsigned char status;
+
+    if (PTX) return (0);
+    // Read MiRF status 
+    mirf_CSN_lo;                                // Pull down chip select
+    status = spi(NOP);                          // Read status register
+    mirf_CSN_hi;                                // Pull up chip select
+    return status & (1<<RX_DR);
+}
+
+void  mirf_get_data(void) 
+// Reads mirf_PAYLOAD bytes into data array
+{
+  unsigned char iii;
+
+    mirf_CSN_lo;                               // Pull down chip select
+    spi( R_RX_PAYLOAD );                        // Send cmd to read rx payload
+
+  for (iii=0;iii<mirf_PAYLOAD;iii++)
+      {
+       buffer[iii]=spi(0);                     // Write payload 
+      };   
+
+    mirf_CSN_hi;                               // Pull up chip select
+    mirf_config_register(STATUS,(1<<RX_DR));   // Reset status register
+    
+}
+
+
+
+
+// Watchdog timeout interrupt service routine
+interrupt [WDT] void wdt_timeout_isr(void)
+{
+
+        ii++; 
+        PORTC.2=1; // питание ADC-делителя 
+        DIDR0=0x00;
+        ADMUX=ADC_VREF_TYPE & 0xff;
+        ADCSRA=0x87;    
+        delay_ms(5);
+        i=(read_adc(3)-8)*72/10;    
+        DIDR0=0x00;
+        ADMUX=ADC_VREF_TYPE & 0xff;
+        ADCSRA=0x00; 
+        PORTC.2=0; // питание ADC-делителя       
+                      
+//        if (i>=3400)  pause=320; 
+//        if (i>=3600)  pause=160; 
+//        if (i>=3800)  pause=80; 
+//        if (i>=4000)  pause=40;  
+//        if (i>=4200)  pause=20;  
+//        if (i>=4600)  pause=15; 
+//        if (i>=4800)  pause=10;  
+//        if (i>=5000)  pause=5; 
+//        
+//        
+        if (i>3000)  pause=12; 
+        if (i>3500)  pause=10; 
+        if (i>4000)  pause=8; 
+        
+
+   if (ii>=pause) 
+    {
+     ii=0;
+     start=1;  
+    }  
+  
+
+}
+
+
+
+
+void main(void)
+{
+{
+// Declare your local variables here
+
+// Crystal Oscillator division factor: 1
+#pragma optsize-
+CLKPR=0x80;
+CLKPR=0x00;
+#ifdef _OPTIMIZE_SIZE_
+#pragma optsize+
+#endif
+
+
+        DDRB=0b11111111;
+        DDRC=0b11110111;
+        DDRD=0b11111011;
+        PORTB=0b00000000;
+        PORTC=0b00000000;
+        PORTD=0b00000000; 
+        
+
+// Timer/Counter 0 initialization
+// Clock source: System Clock
+// Clock value: Timer 0 Stopped
+// Mode: Normal top=FFh
+// OC0A output: Disconnected
+// OC0B output: Disconnected
+TCCR0A=0x00;
+TCCR0B=0x00;
+TCNT0=0x00;
+OCR0A=0x00;
+OCR0B=0x00;
+
+// Timer/Counter 1 initialization
+// Clock source: System Clock
+// Clock value: Timer1 Stopped
+// Mode: Normal top=FFFFh
+// OC1A output: Discon.
+// OC1B output: Discon.
+// Noise Canceler: Off
+// Input Capture on Falling Edge
+// Timer1 Overflow Interrupt: Off
+// Input Capture Interrupt: Off
+// Compare A Match Interrupt: Off
+// Compare B Match Interrupt: Off
+TCCR1A=0x00;
+TCCR1B=0x00;
+TCNT1H=0x00;
+TCNT1L=0x00;
+ICR1H=0x00;
+ICR1L=0x00;
+OCR1AH=0x00;
+OCR1AL=0x00;
+OCR1BH=0x00;
+OCR1BL=0x00;
+
+// Timer/Counter 2 initialization
+// Clock source: System Clock
+// Clock value: Timer2 Stopped
+// Mode: Normal top=FFh
+// OC2A output: Disconnected
+// OC2B output: Disconnected
+ASSR=0x00;
+TCCR2A=0x00;
+TCCR2B=0x00;
+TCNT2=0x00;
+OCR2A=0x00;
+OCR2B=0x00;
+
+// External Interrupt(s) initialization
+// INT0: On
+// INT0 Mode: Falling Edge
+// INT1: Off
+// Interrupt on any change on pins PCINT0-7: Off
+// Interrupt on any change on pins PCINT8-14: Off
+// Interrupt on any change on pins PCINT16-23: Off
+EICRA=0x02;
+EIMSK=0x01;
+EIFR=0x01;
+PCICR=0x00;
+
+
+// Timer/Counter 0 Interrupt(s) initialization
+TIMSK0=0x00;
+// Timer/Counter 1 Interrupt(s) initialization
+TIMSK1=0x00;
+// Timer/Counter 2 Interrupt(s) initialization
+TIMSK2=0x00;
+
+// Analog Comparator initialization
+// Analog Comparator: Off
+// Analog Comparator Input Capture by Timer/Counter 1: Off
+ACSR=0x80;
+ADCSRB=0x00;
+
+// SPI initialization
+// SPI Type: Master
+// SPI Clock Rate: 125 kHz
+// SPI Clock Phase: Cycle Half
+// SPI Clock Polarity: Low
+// SPI Data Order: MSB First
+SPCR=0x53;
+SPSR=0x00;
+
+
+
+// Watchdog Timer initialization
+// Watchdog Timer Prescaler: OSC/1024k
+// Watchdog Timer interrupt: On
+#pragma optsize-
+#asm("wdr")
+WDTCSR=0x18;
+WDTCSR=0x61;
+#ifdef _OPTIMIZE_SIZE_
+#pragma optsize+
+#endif
+
+
+} 
+
+ //delay_ms(5);
+
+        PORTC.2=1;  //питание ADC-делителя 
+        DIDR0=0x00;
+        ADMUX=ADC_VREF_TYPE & 0xff;
+        ADCSRA=0x87;    
+        delay_ms(5);
+        i=((long int)(read_adc(3))*718/100+10);    
+        DIDR0=0x00;
+        ADMUX=ADC_VREF_TYPE & 0xff;
+        ADCSRA=0x00; 
+        PORTC.2=0;  //питание ADC-делителя       
+                      
+//        if (i>3400)  pause=320; 
+//        if (i>3600)  pause=160; 
+//        if (i>3800)  pause=80; 
+//        if (i>4000)  pause=40;  
+//        if (i>4350)  pause=20;  
+//        if (i>4750)  pause=15; 
+//        if (i>5000)  pause=10;  
+//        if (i>5200)  pause=5; 
+//        if (i>5400)  pause=2; 
+
+        if (i>3000)  pause=12; 
+        if (i>3500)  pause=10; 
+        if (i>4000)  pause=8; 
+
+        
+
+   
+  sleep_enable();   
+  
+#asm("sei")
+
+while (1)                                    
+      {     
+      if (start==1)
+           
+        { 
+            
+        DDRB=0b11111111;
+        DDRC=0b11110111;
+        DDRD=0b11111011;
+        PORTB=0b00000000;
+        PORTC=0b00000000;
+        PORTD=0b00000000; 
+             
+        start=0; 
+        send++;  
+
+        //if (i>3300)   
+        if (i>3000)
+         { 
+
+            EICRA=0x02;
+            EIMSK=0x01;
+            EIFR=0x01;
+            PCICR=0x00;
+                
+            PORTD.7=1; // питание Ds18b20
+            delay_ms(10);  
+            w1_init(); 
+             
+//             if (pause==2 || pause==5 || pause==10)  ds18b20_init(0,25,35,DS18B20_12BIT_RES);  
+//             if (pause==15  || pause==20)  ds18b20_init(0,25,35,DS18B20_11BIT_RES); 
+//             if (pause==40)  ds18b20_init(0,25,35,DS18B20_10BIT_RES); 
+//             if (pause>41)  ds18b20_init(0,25,35,DS18B20_9BIT_RES); 
+
+          ds18b20_init(0,25,35,DS18B20_12BIT_RES);  
+
+             
+            temp=(ds18b20_temperature(0)*10)+1000;
+            tt1=(unsigned int)temp; 
+            PORTD.7=0; // питание Ds18b20  
+                
+                 
+            buffer[6]=send;        
+            buffer[1]=i/256;    
+            buffer[2]=i%256;   
+            buffer[3]=tt1/256;    
+            buffer[4]=tt1%256;        
+            buffer[5]=pause;  
+              
+            SPCR=0x52;
+            SPSR=0x00;    
+            PORTD.1=1; // питание nRF24L01 
+            delay_ms(10);
+            mirf_init();
+            delay_ms(10);         
+            mirf_config_RX();  
+            delay_ms(10);
+            mirf_send();
+            PORTD.1=0; // питание nRF24L01  
+          
+            
+         };
+        };
+        
+                   
+
+
+        PORTB=0b00000000;
+        PORTC=0b00000000;
+        PORTD=0b00000000; 
+         
+        SPCR=0x00;
+        SPSR=0x00;
+        EICRA=0x00;
+        EIMSK=0x00;
+        EIFR=0x00;
+        PCICR=0x00; 
+
+      sleep_enable();
+        powerdown();  
+         
+      //if (i<5450) powerdown();         
+       
+                
+      };
+}
